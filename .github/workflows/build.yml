@@ -1,0 +1,115 @@
+name: Build VLine Practice Tools
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Locate and validate current VLine source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_rel='src/client/java/com/vlineaim/training/VLineTrainingClient.java'
+          is_current_source() {
+            local src="$1"
+            [[ -f "$src" ]] || return 1
+            # This removed API was used by the earlier, incompatible source.
+            ! grep -q 'shouldRenderHitboxes[[:space:]]*(' "$src"
+          }
+          is_complete_project() {
+            local root="$1"
+            [[ -f "$root/build.gradle" && -f "$root/settings.gradle" \
+              && -f "$root/src/main/resources/fabric.mod.json" ]] \
+              && is_current_source "$root/$source_rel"
+          }
+
+          if is_complete_project "$PWD"; then
+            echo 'Current VLine project source found in repository root.'
+          else
+            echo 'Root project is incomplete or has stale VLineTrainingClient.java; searching ZIPs for the corrected source.'
+            found=''
+            tmp="$(mktemp -d)"
+            trap 'rm -rf "$tmp"' EXIT
+            shopt -s nullglob
+            for archive in ./*.zip; do
+              entries="$(unzip -Z1 "$archive" 2>/dev/null || true)"
+              grep -Eq '(^|/)build\.gradle$' <<< "$entries" || continue
+              grep -Eq '(^|/)settings\.gradle$' <<< "$entries" || continue
+              grep -Eq '(^|/)src/main/resources/fabric\.mod\.json$' <<< "$entries" || continue
+              source_entry="$(grep -E '(^|/)src/client/java/com/vlineaim/training/VLineTrainingClient\.java$' <<< "$entries" | head -n 1 || true)"
+              [[ -n "$source_entry" ]] || continue
+              source_text="$(unzip -p "$archive" "$source_entry" 2>/dev/null || true)"
+              grep -q 'shouldRenderHitboxes[[:space:]]*(' <<< "$source_text" && continue
+
+              echo "Using corrected source from $archive"
+              mkdir -p "$tmp/extracted"
+              unzip -q "$archive" -d "$tmp/extracted"
+              extracted_source="$(find "$tmp/extracted" -type f -path '*/src/client/java/com/vlineaim/training/VLineTrainingClient.java' -print -quit)"
+              [[ -n "$extracted_source" ]] || continue
+              project_root="${extracted_source%/src/client/java/com/vlineaim/training/VLineTrainingClient.java}"
+              [[ -f "$project_root/build.gradle" && -f "$project_root/settings.gradle" && -f "$project_root/src/main/resources/fabric.mod.json" ]] || continue
+              cp -a "$project_root"/. ./
+              found='yes'
+              break
+            done
+            if [[ "$found" != 'yes' ]]; then
+              echo '::error::The repository still contains the old source calling shouldRenderHitboxes(), and no corrected source ZIP was found.'
+              echo 'Replace src/client/java/com/vlineaim/training/VLineTrainingClient.java with the updated file from this project, or upload the complete corrected ZIP to the repository root.'
+              echo 'Source path currently in repository:'
+              if [[ -f "$source_rel" ]]; then nl -ba "$source_rel" | sed -n '75,115p'; else echo 'Not found'; fi
+              echo 'Repository files:'
+              find . -maxdepth 5 -type f -not -path './.git/*' -print | sort || true
+              exit 1
+            fi
+          fi
+
+          if ! is_complete_project "$PWD"; then
+            echo '::error::Project source is not the corrected version; refusing to compile stale source.'
+            exit 1
+          fi
+          echo 'Verified: source does not call removed shouldRenderHitboxes() method.'
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.7.1'
+
+      - name: Build mod
+        run: gradle --no-daemon --no-configuration-cache clean build
+
+      - name: Show distributable JARs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t jars < <(find build/libs -maxdepth 1 -type f -name '*.jar' \
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-dev.jar' -print | sort)
+          if [[ ${#jars[@]} -eq 0 ]]; then
+            echo '::error::No distributable mod JAR was created in build/libs/.'
+            find build/libs -maxdepth 1 -type f -print || true
+            exit 1
+          fi
+          printf 'Built mod JAR: %s\n' "${jars[@]}"
+
+      - name: Upload mod artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vline-practice-tools-minecraft-26.1.2
+          path: build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 14
